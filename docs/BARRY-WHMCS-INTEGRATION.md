@@ -28,29 +28,65 @@ this repo (`xshredo-agent-setup`).
 1. Get the shared delivery secret from xShredo (`AI_DELIVER_KEY`) — it lives
    in the xShredo VPS `.env`; keep it in WHMCS's stored config, never in git.
 2. Decide where the hook lives. WHMCS options:
-   - **Provisioning module** `CreateAccount` callback (cleanest), or
-   - a `post-provisioning` shell step in the VM template / cloud-init that
-     curl's the bootstrap.
+   - **Provisioning module** `CreateAccount` callback (cleanest) — the
+     delivery POST runs on the WHMCS host, so `AI_DELIVER_KEY` never leaves
+     the server-side config. **Preferred.**
+   - A WHMCS **hook function** on `AfterModuleCreate` that curl's the
+     deliver endpoint from the WHMCS host — same security property.
+   - Do **not** run the delivery call from inside the guest VM template or
+     cloud-init: that would bake `AI_DELIVER_KEY` into the machine image,
+     its metadata or its logs, visible to the customer who owns the VM.
 
 ---
 
-## The hook (runs on the new VM after provisioning)
+## Products to create in WHMCS (the ask, 2026-11)
+
+One product group, **"AI Computers"**, monthly billing only — the xShredo
+landing sells exactly these three SKUs at these prices:
+
+| Product | WHMCS product name | Monthly | vCPU | RAM | NVMe | Traffic |
+|---------|--------------------|---------|------|-----|------|---------|
+| AI-8    | `AI-8`             | $19     | 2    | 8 GB  | 80 GB  | 2 TB |
+| AI-16   | `AI-16` (featured) | $39     | 4    | 16 GB | 160 GB | 3 TB |
+| AI-32   | `AI-32`            | $79     | 8    | 32 GB | 320 GB | 4 TB |
+
+Requirements:
+
+- **Monthly term only** on all three (landing promises "monthly billing,
+  cancel anytime" — no quarterly/annual setup needed for now).
+- KVM virtualization, Tampa (TPA01/TPA02), NVMe storage — same iron as the
+  existing virtual-servers line, just the AI product packaging.
+- Template the VMs with the open agent stack (OpenClaw runtime, Open WebUI,
+  n8n, Playwright) so the post-provisioning hook has a base to configure.
+- **Email policy:** the WHMCS client email must be the same address the
+  customer registered with on xshredo.com — the delivery call matches
+  clients by email, and unmatched emails fail with a clean 404.
+- Send back the three WHMCS product IDs / store URLs once created — they
+  become the `providerRef` checkout targets on the xShredo side.
+
+---
+
+## The hook (runs on the WHMCS host, drives the new VM over SSH)
+
+Two steps, both launched from the WHMCS host — the secret stays there:
+
+**Step 1 — configure the VM.** SSH into the freshly provisioned machine
+and run the framework bootstrap (`FRAMEWORK` comes from the order: the
+customer picks **OpenClaw** or **Hermes** at checkout; if the template
+doesn't read it yet, default to `openclaw`):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/romangalaxys10-spec/xshredo-agent-setup/main/bootstrap.sh \
+ssh root@<new-vm-ip> 'curl -fsSL https://raw.githubusercontent.com/romangalaxys10-spec/xshredo-agent-setup/main/bootstrap.sh \
   FRAMEWORK=openclaw \
-  XSHREDO_DELIVER_URL=https://xshredo.com/api/ai-computer/deliver \
-  XSHREDO_DELIVER_KEY=<AI_DELIVER_KEY> \
-  CLIENT_EMAIL=<customer email from the order> \
-  sh
+  sh'
 ```
 
-- `FRAMEWORK` comes from the order: the customer picks **OpenClaw** or
-  **Hermes** at checkout (xShredo stores it on the order/machine record).
-  If your template doesn't read it yet, default to `openclaw`.
-- The bootstrap installs Docker + the framework, then **rotates the root
-  password** and registers the machine (host + new credential, encrypted)
-  into the customer's xShredo console via:
+The bootstrap installs Docker + the framework, then **rotates the root
+password**.
+
+**Step 2 — register the machine with xShredo.** From the WHMCS host
+(after the rotation), POST the new credentials — xShredo stores them
+encrypted (AES-256-GCM):
 
 ```
 POST https://xshredo.com/api/ai-computer/deliver
@@ -70,7 +106,9 @@ the machine immediately.
   never displayed again — rotation is the customer's lever, via support.
 - Framework switching **after** delivery is a customer-side console action;
   the manifest applies on the next provisioning sync. No WHMCS involvement.
-- The bootstrap never phones home except to the xShredo deliver URL above.
+- The bootstrap inside the guest never phones home at all — registration
+  is done by the WHMCS-host hook (step 2), so no keys or customer data
+  ever exist inside the VM image.
 - If the registration call fails (xShredo unreachable), the VM is still
   fully usable — the machine can be added to the console manually.
 
